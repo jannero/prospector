@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 from collections import defaultdict
+import multiprocessing
 import re
 import sys
 import os
@@ -14,6 +15,8 @@ from prospector.tools.pylint.linter import ProspectorLinter
 _UNUSED_WILDCARD_IMPORT_RE = re.compile(
     r'^Unused import (.*) from wildcard import$')
 
+_linter = None
+
 
 class PylintTool(ToolBase):
     # There are several methods on this class which could technically
@@ -23,7 +26,7 @@ class PylintTool(ToolBase):
 
     def __init__(self):
         self._args = self._extra_sys_path = None
-        self._collector = self._linter = None
+        self._linter = None
         self._orig_sys_path = []
 
     def _prospector_configure(self, prospector_config, linter):
@@ -111,7 +114,6 @@ class PylintTool(ToolBase):
         return errors
 
     def configure(self, prospector_config, found_files):
-
         config_messages = []
         extra_sys_path = found_files.get_minimal_syspath()
 
@@ -201,11 +203,6 @@ class PylintTool(ToolBase):
         # we don't want similarity reports right now
         linter.disable('similarities')
 
-        # use the collector 'reporter' to simply gather the messages
-        # given by PyLint
-        self._collector = Collector(linter.msgs_store)
-        linter.set_reporter(self._collector)
-
         self._linter = linter
         return configured_by, config_messages
 
@@ -253,8 +250,38 @@ class PylintTool(ToolBase):
         return sorted(combined)
 
     def run(self, found_files):
-        self._linter.check(self._args)
+        all_messages = []
+        with multiprocessing.Pool(
+            # Based on quite quick testing leaving one core free from workers results in a bit faster total processing time
+            multiprocessing.cpu_count() - 1,
+            initializer=set_linter,
+            initargs=[self._linter]
+        ) as p:
+            files = self._args
+            files = found_files.iter_file_paths()
+            for messages_from_single_file in p.imap_unordered(
+                lint,
+                files,
+                chunksize=1,
+            ):
+                all_messages.extend(messages_from_single_file)
+
         sys.path = self._orig_sys_path
 
-        messages = self._collector.get_messages()
-        return self.combine(messages)
+        return self.combine(all_messages)
+
+
+def set_linter(linter):
+    global _linter
+    _linter = linter
+
+
+def lint(path):
+    # use the collector 'reporter' to simply gather the messages
+    # given by PyLint
+    collector = Collector(_linter.msgs_store)
+    _linter.set_reporter(collector)
+
+    _linter.check([path])
+
+    return collector.get_messages()
